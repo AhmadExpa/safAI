@@ -26,6 +26,26 @@ xai_router = APIRouter()
 # XAI API configuration - used via lazy loading
 _xai_config = None
 
+
+def _clean_env_value(value, default=None):
+    if value is None:
+        return default
+    cleaned = value.strip().replace('"', '').replace("'", "")
+    return cleaned or default
+
+
+def _build_xai_http_error(upstream_status: int, error_text: str, model_name: str) -> HTTPException:
+    detail = (error_text or "Unknown XAI upstream error").strip()
+    if upstream_status in {401, 403, 404, 429}:
+        return HTTPException(
+            status_code=503,
+            detail=f"XAI model unavailable for `{model_name}`: {detail}",
+        )
+    return HTTPException(
+        status_code=502,
+        detail=f"XAI API error for `{model_name}` ({upstream_status}): {detail}",
+    )
+
 def get_xai_config():
     """Get XAI configuration with lazy loading to ensure env vars are loaded"""
     global _xai_config
@@ -33,18 +53,17 @@ def get_xai_config():
         from dotenv import load_dotenv
         load_dotenv()
         
-        api_key = os.getenv("XAI_API_KEY")
-        if api_key:
-            api_key = api_key.strip().replace('"', '').replace("'", "")
-            
+        api_key = _clean_env_value(os.getenv("XAI_API_KEY"))
         proxy_url = os.getenv("PROXY_URL")
         proxy_auth = os.getenv("PROXY_AUTH")
+        image_model = _clean_env_value(os.getenv("XAI_IMAGE_MODEL"), "grok-2-image")
         
         _xai_config = {
             "api_key": api_key,
             "proxy_url": proxy_url,
             "proxy_auth": proxy_auth,
-            "base_url": "https://api.x.ai/v1"
+            "base_url": "https://api.x.ai/v1",
+            "image_model": image_model,
         }
         
         if not _xai_config["api_key"]:
@@ -71,14 +90,14 @@ async def get_xai_response(messages, model_name):
     PROXY_AUTH = config["proxy_auth"]
 
     if not XAI_API_KEY:
-        raise Exception("XAI API key not found")
+        raise HTTPException(status_code=503, detail="XAI_API_KEY is not configured")
     
     logger.info(f"Making XAI API request with {len(messages)} messages for model: {model_name}")
         
     try:
         # Configure proxy if available
         client_kwargs = {
-            "timeout": httpx.Timeout(60.0, connect=10.0),
+            "timeout": httpx.Timeout(90.0, connect=10.0),
             "limits": httpx.Limits(max_keepalive_connections=5, max_connections=10),
             "verify": True,
             "follow_redirects": True
@@ -95,50 +114,68 @@ async def get_xai_response(messages, model_name):
             client_kwargs["proxy"] = proxy_url_with_auth
             logger.info(f"Using proxy for XAI API: {PROXY_URL}")
     
-        async with httpx.AsyncClient(**client_kwargs) as client:
-            logger.info("Sending request to XAI API...")
-            
-            # Convert messages to the format expected by XAI
-            xai_messages = []
-            for msg in messages:
-                xai_messages.append({
-                    "role": msg["role"],
-                    "content": msg["content"]
-                })
-            
-            response = await client.post(
-                f"{XAI_BASE_URL}/chat/completions",
-                headers={
-                    "Authorization": f"Bearer {XAI_API_KEY}",
-                    "Content-Type": "application/json",
-                    "User-Agent": "PhatagiAI/1.0"
-                },
-                json={
-                    "model": model_name,
-                    "messages": xai_messages,
-                    "stream": True,
-                    "max_tokens": 1000
-                }
-            )
-            
-            logger.info(f"XAI API response status: {response.status_code}")
-            
-            if response.status_code != 200:
+        max_retries = 3
+        base_delay = 2
+
+        # Convert messages to the format expected by XAI
+        xai_messages = []
+        for msg in messages:
+            xai_messages.append({
+                "role": msg["role"],
+                "content": msg["content"]
+            })
+
+        for attempt in range(max_retries):
+            try:
+                async with httpx.AsyncClient(**client_kwargs) as client:
+                    logger.info(f"Sending request to XAI API... (attempt {attempt + 1}/{max_retries})")
+                    response = await client.post(
+                        f"{XAI_BASE_URL}/chat/completions",
+                        headers={
+                            "Authorization": f"Bearer {XAI_API_KEY}",
+                            "Content-Type": "application/json",
+                            "User-Agent": "PhatagiAI/1.0"
+                        },
+                        json={
+                            "model": model_name,
+                            "messages": xai_messages,
+                            "stream": True,
+                            "max_tokens": 1000
+                        }
+                    )
+
+                logger.info(f"XAI API response status: {response.status_code}")
+
+                if response.status_code == 200:
+                    return response
+                if response.status_code >= 500 and attempt < max_retries - 1:
+                    delay = base_delay * (2 ** attempt)
+                    logger.warning(f"XAI upstream error {response.status_code}, retrying in {delay} seconds...")
+                    await asyncio.sleep(delay)
+                    continue
+
                 error_text = response.text
                 logger.error(f"XAI API error: {response.status_code} - {error_text}")
-                raise Exception(f"XAI API error: {response.status_code} - {error_text}")
+                raise _build_xai_http_error(response.status_code, error_text, model_name)
+            except (httpx.TimeoutException, httpx.ConnectError, httpx.HTTPError) as exc:
+                if attempt < max_retries - 1:
+                    delay = base_delay * (2 ** attempt)
+                    logger.warning(f"XAI network error on attempt {attempt + 1}: {exc}; retrying in {delay} seconds...")
+                    await asyncio.sleep(delay)
+                    continue
+                raise
             
-            return response
-            
+    except HTTPException:
+        raise
     except httpx.ConnectError as e:
         logger.error(f"XAI API connection error: {e}")
-        raise Exception(f"Failed to connect to XAI API: {e}")
+        raise HTTPException(status_code=503, detail=f"Failed to connect to XAI API: {e}") from e
     except httpx.TimeoutException as e:
         logger.error(f"XAI API timeout error: {e}")
-        raise Exception(f"XAI API request timed out: {e}")
+        raise HTTPException(status_code=503, detail=f"XAI API request timed out: {e}") from e
     except Exception as e:
         logger.error(f"XAI API error: {e}")
-        raise Exception(f"XAI API error: {e}")
+        raise HTTPException(status_code=502, detail=f"XAI API error: {e}") from e
 
 def extract_object_from_direct_request(user_message):
     """Extract the object/subject from direct image generation requests"""
@@ -611,9 +648,10 @@ async def get_xai_image_response(prompt):
     XAI_BASE_URL = config["base_url"]
     PROXY_URL = config["proxy_url"]
     PROXY_AUTH = config["proxy_auth"]
+    IMAGE_MODEL = config["image_model"]
 
     if not XAI_API_KEY:
-        raise Exception("XAI API key not found")
+        raise HTTPException(status_code=503, detail="XAI_API_KEY is not configured")
     
     logger.info(f"Making XAI image generation request for prompt: {prompt[:100]}...")
     
@@ -649,7 +687,7 @@ async def get_xai_image_response(prompt):
                     
                     # Prepare request payload - only include supported parameters
                     payload = {
-                        "model": "grok-2-image",
+                        "model": IMAGE_MODEL,
                         "prompt": prompt
                     }
                     
@@ -691,7 +729,7 @@ async def get_xai_image_response(prompt):
                         error_text = response.content.decode('utf-8', errors='replace')
                     
                     logger.error(f"XAI image API error: {response.status_code} - {error_text}")
-                    raise Exception(f"XAI image API error: {response.status_code} - {error_text}")
+                    raise _build_xai_http_error(response.status_code, error_text, IMAGE_MODEL)
                     
             except (httpx.TimeoutException, httpx.ConnectError, httpx.HTTPError) as e:
                 if attempt < max_retries - 1:
@@ -706,56 +744,50 @@ async def get_xai_image_response(prompt):
                 logger.error(f"Unexpected error in XAI image API call: {e}")
                 raise
             
+    except HTTPException:
+        raise
     except httpx.ConnectError as e:
         logger.error(f"XAI image API connection error: {e}")
-        raise Exception(f"Failed to connect to XAI image API: {e}")
+        raise HTTPException(status_code=503, detail=f"Failed to connect to XAI image API: {e}") from e
     except httpx.TimeoutException as e:
         logger.error(f"XAI image API timeout error: {e}")
-        raise Exception(f"XAI image API request timed out: {e}")
+        raise HTTPException(status_code=503, detail=f"XAI image API request timed out: {e}") from e
     except Exception as e:
         logger.error(f"XAI image API error: {e}")
-        raise Exception(f"XAI image API error: {e}")
+        raise HTTPException(status_code=502, detail=f"XAI image API error: {e}") from e
 
-async def stream_xai_response(messages, model_name) -> AsyncGenerator[str, None]:
-    """Stream response from XAI API"""
-    try:
-        response = await get_xai_response(messages, model_name)
-        
-        async for line in response.aiter_lines():
-            if line.startswith("data: "):
-                data = line[6:]  # Remove "data: " prefix
+async def stream_xai_response(response) -> AsyncGenerator[str, None]:
+    """Stream a validated XAI response."""
+    async for line in response.aiter_lines():
+        if line.startswith("data: "):
+            data = line[6:]  # Remove "data: " prefix
+            
+            if data.strip() == "[DONE]":
+                logger.info("XAI streaming completed")
+                break
                 
-                if data.strip() == "[DONE]":
-                    logger.info("XAI streaming completed")
-                    break
-                    
-                try:
-                    chunk = json.loads(data)
-                    if "choices" in chunk and len(chunk["choices"]) > 0:
-                        delta = chunk["choices"][0].get("delta", {})
-                        if "content" in delta:
-                            content = delta["content"]
-                            
-                            # Debug: Log what we're getting
-                            logger.debug(f"XAI content type: {type(content)}, value: {repr(content)}")
-                            
-                            # Ensure content is a string
-                            if not isinstance(content, str):
-                                content = str(content) if content is not None else ""
-                            
-                            logger.debug(f"XAI streaming chunk: {content}")
-                            yield content
-                except json.JSONDecodeError as e:
-                    logger.warning(f"Failed to parse XAI chunk: {data}, error: {e}")
-                    continue
-            elif line.strip():  # Handle non-data lines
-                logger.debug(f"XAI non-data line: {line}")
+            try:
+                chunk = json.loads(data)
+                if "choices" in chunk and len(chunk["choices"]) > 0:
+                    delta = chunk["choices"][0].get("delta", {})
+                    if "content" in delta:
+                        content = delta["content"]
+                        
+                        # Debug: Log what we're getting
+                        logger.debug(f"XAI content type: {type(content)}, value: {repr(content)}")
+                        
+                        # Ensure content is a string
+                        if not isinstance(content, str):
+                            content = str(content) if content is not None else ""
+                        
+                        logger.debug(f"XAI streaming chunk: {content}")
+                        yield content
+            except json.JSONDecodeError as e:
+                logger.warning(f"Failed to parse XAI chunk: {data}, error: {e}")
                 continue
-                    
-    except Exception as e:
-        logger.error(f"XAI API streaming error: {e}")
-        error_message = f"XAI API is currently unavailable. Please try again later or use a different model. Error: {str(e)}"
-        yield error_message
+        elif line.strip():  # Handle non-data lines
+            logger.debug(f"XAI non-data line: {line}")
+            continue
 
 def get_token_from_header(request: Request):
     auth_header = request.headers.get("Authorization")
@@ -956,11 +988,12 @@ async def chat_and_store(request: Request, chat_request: ChatRequest, model_name
         except Exception as e:
             logger.error(f"Error loading personality: {e}")
     
+    response = await get_xai_response(messages, model_name)
     response_chunks = []
     
     async def event_stream():
         try:
-            async for chunk in stream_xai_response(messages, model_name):
+            async for chunk in stream_xai_response(response):
                 response_chunks.append(chunk)
                 # Format chunk for frontend compatibility with UTF-8 safety
                 try:
@@ -1027,6 +1060,8 @@ async def grok_4_chat(request: Request, chat_request: ChatRequest):
     """Chat with Grok-4 model with multi-turn conversation support"""
     try:
         return await chat_and_store(request, chat_request, "grok-4-fast-reasoning")
+    except HTTPException:
+        raise
     except Exception as e:
         logger.error(f"Grok-4 chat error: {e}")
         raise HTTPException(status_code=500, detail=str(e))
@@ -1036,6 +1071,8 @@ async def grok_3_chat(request: Request, chat_request: ChatRequest):
     """Chat with Grok-3 model with multi-turn conversation support"""
     try:
         return await chat_and_store(request, chat_request, "grok-3")
+    except HTTPException:
+        raise
     except Exception as e:
         logger.error(f"Grok-3 chat error: {e}")
         raise HTTPException(status_code=500, detail=str(e))

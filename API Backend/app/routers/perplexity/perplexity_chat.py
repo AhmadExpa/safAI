@@ -14,6 +14,19 @@ router = APIRouter()
 # Perplexity API configuration - used via lazy loading
 _pplx_config = None
 
+
+def _build_perplexity_http_error(upstream_status: int, error_text: str, model_name: str) -> HTTPException:
+    detail = (error_text or "Unknown Perplexity upstream error").strip()
+    if upstream_status in {401, 403, 404, 429}:
+        return HTTPException(
+            status_code=503,
+            detail=f"Perplexity model unavailable for `{model_name}`: {detail}",
+        )
+    return HTTPException(
+        status_code=502,
+        detail=f"Perplexity API error for `{model_name}` ({upstream_status}): {detail}",
+    )
+
 def get_pplx_config():
     """Get Perplexity configuration with lazy loading to ensure env vars are loaded"""
     global _pplx_config
@@ -55,11 +68,61 @@ class ChatRequest(BaseModel):
     personality_id: str = None
 
 
+async def get_perplexity_response(messages: List[Message], api_key: str) -> tuple[httpx.Response, str]:
+    url = "https://api.perplexity.ai/chat/completions"
+    headers = {
+        "Authorization": f"Bearer {api_key}",
+        "Content-Type": "application/json"
+    }
+    last_error: HTTPException | None = None
+
+    for model_name in PPLX_MODEL_CANDIDATES:
+        try:
+            body = {
+                "model": model_name,
+                "messages": [{"role": m.role, "content": m.content} for m in messages],
+                "stream": True,
+            }
+            logger.info(f"Perplexity: trying model={model_name}")
+            async with httpx.AsyncClient(timeout=300.0) as client:
+                response = await client.post(url, headers=headers, json=body)
+            if response.status_code == 200:
+                logger.info(f"Perplexity: successfully using model={model_name}")
+                return response, model_name
+
+            error_detail = response.text
+            try:
+                error_json = json.loads(error_detail)
+                if isinstance(error_json, dict) and "error" in error_json:
+                    if isinstance(error_json["error"], dict):
+                        error_detail = error_json["error"].get("message", error_detail)
+                    else:
+                        error_detail = str(error_json["error"])
+            except Exception:
+                pass
+
+            logger.warning(f"Perplexity model {model_name} failed: {error_detail}")
+            last_error = _build_perplexity_http_error(response.status_code, error_detail, model_name)
+        except HTTPException as exc:
+            last_error = exc
+        except httpx.ConnectError as exc:
+            raise HTTPException(status_code=503, detail=f"Failed to connect to Perplexity API: {exc}") from exc
+        except httpx.TimeoutException as exc:
+            raise HTTPException(status_code=503, detail=f"Perplexity API request timed out: {exc}") from exc
+        except Exception as exc:
+            logger.warning(f"Perplexity error with model {model_name}: {exc}")
+            last_error = HTTPException(status_code=502, detail=f"Perplexity API error for `{model_name}`: {exc}")
+
+    if last_error:
+        raise last_error
+    raise HTTPException(status_code=502, detail="All Perplexity models failed without a specific upstream error")
+
+
 @router.post("/perplexity/chat")
 async def chat_perplexity(request: Request, chat_request: ChatRequest):
     config = get_pplx_config()
     if not config["api_key"]:
-        raise HTTPException(status_code=500, detail="PPLX_API_KEY is not set")
+        raise HTTPException(status_code=503, detail="PPLX_API_KEY is not configured")
 
     user_id = None
     try:
@@ -71,71 +134,23 @@ async def chat_perplexity(request: Request, chat_request: ChatRequest):
     except Exception as e:
         logger.warning(f"Perplexity auth decode failed: {e}")
 
+    response, model_name = await get_perplexity_response(chat_request.messages, config["api_key"])
+    logger.info(f"Perplexity streaming with validated model={model_name}")
+
     async def event_stream():
-        config = get_pplx_config()
-        api_key = config["api_key"]
-        
-        if not api_key:
-            yield f"data: {json.dumps({'content': 'Perplexity API key not configured'})}\n\n"
-            yield "data: [DONE]\n\n"
-            return
-            
-        url = "https://api.perplexity.ai/chat/completions"
-        headers = {
-            "Authorization": f"Bearer {api_key}",
-            "Content-Type": "application/json"
-        }
-        last_error = None
-        # Try each model candidate until one works
-        for model_name in PPLX_MODEL_CANDIDATES:
+        async for line in response.aiter_lines():
+            if not line or not line.startswith("data: "):
+                continue
+            data = line[6:].strip()
+            if data == "[DONE]":
+                break
             try:
-                body = {
-                    "model": model_name,
-                    "messages": [{"role": m.role, "content": m.content} for m in chat_request.messages],
-                    "stream": True,
-                }
-                logger.info(f"Perplexity: trying model={model_name}")
-                async with httpx.AsyncClient(timeout=300.0) as client:
-                    async with client.stream("POST", url, headers=headers, json=body) as resp:
-                        if resp.status_code != 200:
-                            text = await resp.aread()
-                            error_detail = text.decode()
-                            try:
-                                error_json = json.loads(error_detail)
-                                if isinstance(error_json, dict) and 'error' in error_json:
-                                    if isinstance(error_json['error'], dict):
-                                        error_detail = error_json['error'].get('message', error_detail)
-                                    else:
-                                        error_detail = str(error_json['error'])
-                            except:
-                                pass
-                            logger.warning(f"Perplexity model {model_name} failed: {error_detail}")
-                            last_error = f"API Error ({resp.status_code}): {error_detail}"
-                            continue  # Try next model
-                        # Success! Stream the response
-                        logger.info(f"✅ Perplexity: successfully using model={model_name}")
-                        async for line in resp.aiter_lines():
-                            if not line or not line.startswith("data: "):
-                                continue
-                            data = line[6:].strip()
-                            if data == "[DONE]":
-                                break
-                            try:
-                                parsed = json.loads(data)
-                                delta = parsed.get("choices", [{}])[0].get("delta", {}).get("content")
-                                if delta:
-                                    yield f"data: {json.dumps({'content': delta})}\n\n"
-                            except json.JSONDecodeError:
-                                continue
-                        yield "data: [DONE]\n\n"
-                        return  # Exit after successful response
-            except Exception as e:
-                logger.warning(f"Perplexity error with model {model_name}: {e}")
-                last_error = str(e)
-                continue  # Try next model
-        # All models failed
-        logger.error(f"All Perplexity models failed. Last error: {last_error}")
-        yield f"data: {json.dumps({'content': last_error or 'All Perplexity models unavailable'})}\n\n"
+                parsed = json.loads(data)
+                delta = parsed.get("choices", [{}])[0].get("delta", {}).get("content")
+                if delta:
+                    yield f"data: {json.dumps({'content': delta})}\n\n"
+            except json.JSONDecodeError:
+                continue
         yield "data: [DONE]\n\n"
 
     async def aggregated():

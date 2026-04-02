@@ -95,6 +95,9 @@ async def get_openai_image_response(prompt: str):
     client, api_key = get_openai_client()
     if not api_key:
         raise Exception("OpenAI API key not found")
+
+    proxy_url = os.getenv("PROXY_URL")
+    proxy_auth = os.getenv("PROXY_AUTH")
     
     logger.info(f"Making OpenAI DALL-E image generation request for prompt: {prompt[:100]}...")
     
@@ -717,13 +720,24 @@ async def chat_and_store(request: Request, chat_request: ChatRequest, model_name
                         "messages": messages,
                         "stream": True,
                         "temperature": 0.7,
-                        "max_tokens": 1000
                     }
+
+                    reasoning_models = {"o3-mini", "o4-mini"}
+                    if model_name in reasoning_models:
+                        api_params["max_completion_tokens"] = 1000
+                    else:
+                        api_params["max_tokens"] = 1000
                     
                     # Apply personality rules to parameters
                     if personality_data:
                         api_params = apply_personality_rules(personality_data, api_params)
-                        logger.info(f"Applied personality rules: temp={api_params['temperature']}, max_tokens={api_params['max_tokens']}")
+                        if model_name in reasoning_models and "max_tokens" in api_params:
+                            api_params["max_completion_tokens"] = api_params.pop("max_tokens")
+                        max_tokens_value = api_params.get("max_completion_tokens", api_params.get("max_tokens"))
+                        logger.info(f"Applied personality rules: temp={api_params.get('temperature')}, max_tokens={max_tokens_value}")
+
+                    if model_name in reasoning_models:
+                        api_params.pop("temperature", None)
                     
                     response = client.chat.completions.create(**api_params)
                     for chunk in response:
@@ -975,11 +989,15 @@ async def chat_deepseek_r1(request: Request, chat_request: ChatRequest):
 # Grok endpoints
 @router.post("/grok-3/chat")
 async def chat_grok_3(request: Request, chat_request: ChatRequest):
-    return await chat_and_store(request, chat_request, "grok-3")
+    from app.routers.xai.xai_chat import grok_3_chat as xai_grok_3_chat
+
+    return await xai_grok_3_chat(request, chat_request)
 
 @router.post("/grok-4/chat")
 async def chat_grok_4(request: Request, chat_request: ChatRequest):
-    return await chat_and_store(request, chat_request, "grok-4")
+    from app.routers.xai.xai_chat import grok_4_chat as xai_grok_4_chat
+
+    return await xai_grok_4_chat(request, chat_request)
 
 # Grok image generation is handled by the XAI router
 # @router.post("/grok-2-image/chat")
@@ -989,11 +1007,15 @@ async def chat_grok_4(request: Request, chat_request: ChatRequest):
 # Qwen endpoints
 @router.post("/qwen1/chat")
 async def chat_qwen1(request: Request, chat_request: ChatRequest):
-    return await chat_and_store(request, chat_request, "qwen1")
+    from app.routers.qwen.qwen_chat import qwen1_chat as qwen_1_chat
+
+    return await qwen_1_chat(request, chat_request)
 
 @router.post("/qwen2/chat")
 async def chat_qwen2(request: Request, chat_request: ChatRequest):
-    return await chat_and_store(request, chat_request, "qwen2")
+    from app.routers.qwen.qwen_chat import qwen2_chat as qwen_2_chat
+
+    return await qwen_2_chat(request, chat_request)
 
 
 

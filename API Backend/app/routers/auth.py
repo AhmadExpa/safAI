@@ -4,7 +4,7 @@ from pydantic import BaseModel, EmailStr
 from passlib.context import CryptContext
 from jose import jwt, JWTError
 from datetime import datetime, timedelta
-from sqlalchemy import Column, String, DateTime, ForeignKey, Text
+from sqlalchemy import Column, String, DateTime, ForeignKey, Text, text
 from sqlalchemy.ext.declarative import declarative_base
 from sqlalchemy.orm import sessionmaker, relationship
 from sqlalchemy.ext.asyncio import create_async_engine, AsyncSession
@@ -298,6 +298,16 @@ def get_token_from_header(request: Request):
     return auth_header.split(" ", 1)[1]
 
 async def check_blacklist(request: Request, db: AsyncSession = Depends(get_db)):
+    await db.execute(
+        text(
+            """
+            CREATE TABLE IF NOT EXISTS blacklisted_tokens (
+                token VARCHAR PRIMARY KEY,
+                expires TIMESTAMP NOT NULL
+            )
+            """
+        )
+    )
     token = get_token_from_header(request)
     result = await db.execute(select(BlacklistedToken).where(BlacklistedToken.token == token))
     blacklisted = result.scalar_one_or_none()
@@ -307,6 +317,16 @@ async def check_blacklist(request: Request, db: AsyncSession = Depends(get_db)):
 
 @router.post("/logout")
 async def logout(request: Request, db: AsyncSession = Depends(get_db)):
+    await db.execute(
+        text(
+            """
+            CREATE TABLE IF NOT EXISTS blacklisted_tokens (
+                token VARCHAR PRIMARY KEY,
+                expires TIMESTAMP NOT NULL
+            )
+            """
+        )
+    )
     token = get_token_from_header(request)
     try:
         # Decode token to get expiry
@@ -341,8 +361,27 @@ async def read_users_me(
     db: AsyncSession = Depends(get_db),
     token: str = Depends(check_blacklist)
 ):
-    # ... decode token, get user info, etc.
-    ...
+    try:
+        payload = jwt.decode(token, SECRET_KEY, algorithms=[ALGORITHM])
+        email = payload.get("sub")
+        if email is None:
+            raise HTTPException(status_code=401, detail="Invalid token payload.")
+
+        result = await db.execute(select(User).where(User.email == email))
+        db_user = result.scalar_one_or_none()
+        if not db_user:
+            raise HTTPException(status_code=404, detail="User not found.")
+
+        return {
+            "id": str(db_user.user_id),
+            "email": db_user.email,
+            "full_name": db_user.username,
+            "created_at": db_user.created_at.isoformat() if db_user.created_at else None,
+        }
+    except HTTPException:
+        raise
+    except JWTError:
+        raise HTTPException(status_code=401, detail="Invalid token.")
 
 # NOTE: You must create the password_reset_tokens table in your database (via Alembic migration or manual SQL) for this to work in production.
 

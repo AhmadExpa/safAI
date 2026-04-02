@@ -21,6 +21,19 @@ qwen_router = APIRouter()
 # Qwen API configuration - used via lazy loading
 _qwen_config = None
 
+
+def _build_qwen_http_error(upstream_status: int, error_text: str, model_name: str) -> HTTPException:
+    detail = (error_text or "Unknown Qwen upstream error").strip()
+    if upstream_status in {401, 403, 404, 429}:
+        return HTTPException(
+            status_code=503,
+            detail=f"Qwen model unavailable for `{model_name}`: {detail}",
+        )
+    return HTTPException(
+        status_code=502,
+        detail=f"Qwen API error for `{model_name}` ({upstream_status}): {detail}",
+    )
+
 def get_qwen_config():
     """Get Qwen configuration with lazy loading to ensure env vars are loaded"""
     global _qwen_config
@@ -121,7 +134,7 @@ async def get_qwen_response(messages, model_name, api_key, base_url, max_retries
     """Get response from Qwen API with retry logic and better error handling"""
     if not api_key:
         logger.error(f"Qwen API key not found for {model_name}")
-        raise Exception(f"Qwen API key not found for {model_name}")
+        raise HTTPException(status_code=503, detail=f"Qwen API key not configured for {model_name}")
     
     logger.info(f"Making Qwen API request with {len(messages)} messages for model: {model_name}")
     logger.info(f"Using API endpoint: {base_url}")
@@ -175,7 +188,7 @@ async def get_qwen_response(messages, model_name, api_key, base_url, max_retries
                     return response
                 elif response.status_code == 401:
                     logger.error("Qwen API authentication failed - check API key")
-                    raise Exception("Qwen API authentication failed - invalid API key")
+                    raise _build_qwen_http_error(response.status_code, "Qwen API authentication failed - invalid API key", model_name)
                 elif response.status_code == 429:
                     logger.warning("Qwen API rate limit exceeded")
                     if attempt < max_retries - 1:
@@ -185,7 +198,7 @@ async def get_qwen_response(messages, model_name, api_key, base_url, max_retries
                         await asyncio.sleep(wait_time)
                         continue
                     else:
-                        raise Exception("Qwen API rate limit exceeded after all retries")
+                        raise _build_qwen_http_error(response.status_code, "Qwen API rate limit exceeded after all retries", model_name)
                 else:
                     error_text = response.text
                     logger.error(f"Qwen API error: {response.status_code} - {error_text}")
@@ -196,8 +209,10 @@ async def get_qwen_response(messages, model_name, api_key, base_url, max_retries
                         await asyncio.sleep(wait_time)
                         continue
                     else:
-                        raise Exception(f"Qwen API error: {response.status_code} - {error_text}")
+                        raise _build_qwen_http_error(response.status_code, error_text, model_name)
                         
+        except HTTPException:
+            raise
         except httpx.ConnectError as e:
             logger.error(f"Qwen API connection error (attempt {attempt + 1}): {e}")
             if attempt < max_retries - 1:
@@ -207,7 +222,7 @@ async def get_qwen_response(messages, model_name, api_key, base_url, max_retries
                 await asyncio.sleep(wait_time)
                 continue
             else:
-                raise Exception(f"Failed to connect to Qwen API after {max_retries} attempts: {e}")
+                raise HTTPException(status_code=503, detail=f"Failed to connect to Qwen API after {max_retries} attempts: {e}") from e
         except httpx.TimeoutException as e:
             logger.error(f"Qwen API timeout error (attempt {attempt + 1}): {e}")
             if attempt < max_retries - 1:
@@ -217,7 +232,7 @@ async def get_qwen_response(messages, model_name, api_key, base_url, max_retries
                 await asyncio.sleep(wait_time)
                 continue
             else:
-                raise Exception(f"Qwen API request timed out after {max_retries} attempts: {e}")
+                raise HTTPException(status_code=503, detail=f"Qwen API request timed out after {max_retries} attempts: {e}") from e
         except Exception as e:
             logger.error(f"Qwen API error (attempt {attempt + 1}): {e}")
             if attempt < max_retries - 1:
@@ -227,63 +242,55 @@ async def get_qwen_response(messages, model_name, api_key, base_url, max_retries
                 await asyncio.sleep(wait_time)
                 continue
             else:
-                raise Exception(f"Qwen API error after {max_retries} attempts: {e}")
+                raise HTTPException(status_code=502, detail=f"Qwen API error after {max_retries} attempts: {e}") from e
     
     # This should never be reached, but just in case
-    raise Exception(f"Qwen API failed after {max_retries} attempts")
+    raise HTTPException(status_code=502, detail=f"Qwen API failed after {max_retries} attempts")
 
-async def stream_qwen_response(messages, model_name, api_key, base_url) -> AsyncGenerator[str, None]:
-    """Stream response from Qwen API with DashScope format"""
-    try:
-        response = await get_qwen_response(messages, model_name, api_key, base_url)
-        
-        logger.info("Starting to stream Qwen response")
-        
-        async for line in response.aiter_lines():
-            if line.startswith("data: "):
-                data = line[6:]  # Remove "data: " prefix
+async def stream_qwen_response(response) -> AsyncGenerator[str, None]:
+    """Stream a validated Qwen response with DashScope format."""
+    logger.info("Starting to stream Qwen response")
+    
+    async for line in response.aiter_lines():
+        if line.startswith("data: "):
+            data = line[6:]  # Remove "data: " prefix
+            
+            if data.strip() == "[DONE]":
+                logger.info("Qwen streaming completed")
+                break
                 
-                if data.strip() == "[DONE]":
-                    logger.info("Qwen streaming completed")
-                    break
-                    
-                try:
-                    chunk = json.loads(data)
-                    logger.debug(f"Qwen streaming chunk: {chunk}")
-                    
-                    # Handle DashScope API response format
-                    if "output" in chunk and "choices" in chunk["output"]:
-                        choices = chunk["output"]["choices"]
-                        if choices and len(choices) > 0:
-                            choice = choices[0]
-                            if "message" in choice and "content" in choice["message"]:
-                                content = choice["message"]["content"]
-                                logger.debug(f"Qwen streaming content: {content}")
-                                yield content
-                    # Fallback to OpenAI-compatible format
-                    elif "choices" in chunk and len(chunk["choices"]) > 0:
-                        delta = chunk["choices"][0].get("delta", {})
-                        if "content" in delta:
-                            content = delta["content"]
-                            logger.debug(f"Qwen streaming chunk: {content}")
+            try:
+                chunk = json.loads(data)
+                logger.debug(f"Qwen streaming chunk: {chunk}")
+                
+                # Handle DashScope API response format
+                if "output" in chunk and "choices" in chunk["output"]:
+                    choices = chunk["output"]["choices"]
+                    if choices and len(choices) > 0:
+                        choice = choices[0]
+                        if "message" in choice and "content" in choice["message"]:
+                            content = choice["message"]["content"]
+                            logger.debug(f"Qwen streaming content: {content}")
                             yield content
-                    # Handle error responses
-                    elif "error" in chunk:
-                        error_msg = chunk["error"].get("message", "Unknown error")
-                        logger.error(f"Qwen API error in stream: {error_msg}")
-                        yield f"Error: {error_msg}"
-                        
-                except json.JSONDecodeError as e:
-                    logger.warning(f"Failed to parse Qwen chunk: {data}, error: {e}")
-                    continue
-            elif line.strip():  # Handle non-data lines
-                logger.debug(f"Qwen non-data line: {line}")
-                continue
+                # Fallback to OpenAI-compatible format
+                elif "choices" in chunk and len(chunk["choices"]) > 0:
+                    delta = chunk["choices"][0].get("delta", {})
+                    if "content" in delta:
+                        content = delta["content"]
+                        logger.debug(f"Qwen streaming chunk: {content}")
+                        yield content
+                # Handle error responses
+                elif "error" in chunk:
+                    error_msg = chunk["error"].get("message", "Unknown error")
+                    logger.error(f"Qwen API error in stream: {error_msg}")
+                    yield f"Error: {error_msg}"
                     
-    except Exception as e:
-        logger.error(f"Qwen API streaming error: {e}")
-        error_message = f"Qwen API is currently unavailable. Please try again later or use a different model. Error: {str(e)}"
-        yield error_message
+            except json.JSONDecodeError as e:
+                logger.warning(f"Failed to parse Qwen chunk: {data}, error: {e}")
+                continue
+        elif line.strip():  # Handle non-data lines
+            logger.debug(f"Qwen non-data line: {line}")
+            continue
 
 async def store_chat(user_id, chat_request, response_text, model):
     """Store chat with retry logic and connection handling"""
@@ -399,11 +406,12 @@ async def chat_and_store(request: Request, chat_request: ChatRequest, model_name
     
     # Get response from Qwen API
     messages = [msg.dict() for msg in chat_request.messages]
+    response = await get_qwen_response(messages, model_name, api_key, base_url)
     response_chunks = []
     
     async def event_stream():
         try:
-            async for chunk in stream_qwen_response(messages, model_name, api_key, base_url):
+            async for chunk in stream_qwen_response(response):
                 response_chunks.append(chunk)
                 yield chunk
             
@@ -444,7 +452,11 @@ async def qwen1_chat(request: Request, chat_request: ChatRequest):
     """Chat with Qwen-1.x model"""
     try:
         config = get_qwen_config()["qwen1"]
+        if not config["api_key"]:
+            raise HTTPException(status_code=503, detail="QWEN_1_X_API_KEY is not configured")
         return await chat_and_store(request, chat_request, "qwen-turbo", config["api_key"], config["base_url"])
+    except HTTPException:
+        raise
     except Exception as e:
         logger.error(f"Qwen-1.x chat error: {e}")
         raise HTTPException(status_code=500, detail=str(e))
@@ -455,7 +467,11 @@ async def qwen2_chat(request: Request, chat_request: ChatRequest):
     """Chat with Qwen-2 model"""
     try:
         config = get_qwen_config()["qwen2"]
+        if not config["api_key"]:
+            raise HTTPException(status_code=503, detail="QWEN_2_API_KEY is not configured")
         return await chat_and_store(request, chat_request, "qwen-plus", config["api_key"], config["base_url"])
+    except HTTPException:
+        raise
     except Exception as e:
         logger.error(f"Qwen-2 chat error: {e}")
         raise HTTPException(status_code=500, detail=str(e))
@@ -466,7 +482,11 @@ async def qwen3_chat(request: Request, chat_request: ChatRequest):
     """Chat with Qwen-3 model"""
     try:
         config = get_qwen_config()["qwen3"]
+        if not config["api_key"]:
+            raise HTTPException(status_code=503, detail="QWEN_3_API_KEY is not configured")
         return await chat_and_store(request, chat_request, "qwen-max", config["api_key"], config["base_url"])
+    except HTTPException:
+        raise
     except Exception as e:
         logger.error(f"Qwen-3 chat error: {e}")
         raise HTTPException(status_code=500, detail=str(e))
