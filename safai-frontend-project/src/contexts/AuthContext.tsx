@@ -11,6 +11,7 @@ import {
   getAuthToken,
   setAuthToken,
   clearAuthToken,
+  getCurrentUser,
 } from "@/lib/api";
 
 interface User {
@@ -38,18 +39,62 @@ export function AuthProvider({ children }: { children: ReactNode }) {
 
   // Check for existing session on mount
   useEffect(() => {
-    const storedUser = localStorage.getItem("saifai-user");
-    const token = getAuthToken();
+    let isMounted = true;
 
-    if (storedUser && token) {
+    const initializeAuth = async () => {
+      const url = new URL(window.location.href);
+      const oauthToken = url.searchParams.get("token");
+      const storedUser = localStorage.getItem("saifai-user");
+      const token = oauthToken || getAuthToken();
+
+      if (!token) {
+        if (isMounted) {
+          setIsLoading(false);
+        }
+        return;
+      }
+
       try {
-        setUser(JSON.parse(storedUser));
+        if (oauthToken) {
+          setAuthToken(oauthToken);
+          localStorage.setItem("saifai-registered", "true");
+        }
+
+        if (storedUser && !oauthToken) {
+          setUser(JSON.parse(storedUser));
+        } else {
+          const currentUser = await getCurrentUser(token);
+          const userData: User = {
+            id: currentUser.id,
+            email: currentUser.email,
+            full_name: currentUser.full_name,
+          };
+
+          localStorage.setItem("saifai-user", JSON.stringify(userData));
+          if (isMounted) {
+            setUser(userData);
+          }
+        }
+
+        if (oauthToken) {
+          url.searchParams.delete("token");
+          window.history.replaceState({}, document.title, `${url.pathname}${url.search}${url.hash}`);
+        }
       } catch (e) {
         localStorage.removeItem("saifai-user");
         clearAuthToken();
+      } finally {
+        if (isMounted) {
+          setIsLoading(false);
+        }
       }
-    }
-    setIsLoading(false);
+    };
+
+    void initializeAuth();
+
+    return () => {
+      isMounted = false;
+    };
   }, []);
 
   const signup = async (full_name: string, email: string, password: string) => {

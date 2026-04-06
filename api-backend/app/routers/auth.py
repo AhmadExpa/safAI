@@ -1,5 +1,5 @@
 from fastapi import APIRouter, HTTPException, status, Depends, Body, Request
-from fastapi.responses import JSONResponse
+from fastapi.responses import JSONResponse, RedirectResponse
 from pydantic import BaseModel, EmailStr
 from passlib.context import CryptContext
 from jose import jwt, JWTError
@@ -428,9 +428,9 @@ async def google_callback(request: Request, db: AsyncSession = Depends(get_db)):
         
         # Return a redirect to frontend with token
         frontend_url = os.getenv("FRONTEND_URL", "http://localhost:3000")
-        return JSONResponse(
-            status_code=302,
-            headers={"Location": f"{frontend_url}/chat?token={access_token}"}
+        return RedirectResponse(
+            url=f"{frontend_url.rstrip('/')}/chat?token={access_token}",
+            status_code=302
         )
     except Exception as e:
         logging.error(f"Google OAuth callback error: {e}")

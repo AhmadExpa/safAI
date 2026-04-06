@@ -705,7 +705,7 @@ export async function deleteWorkspace(workspaceId: string): Promise<void> {
 
 // Get Google OAuth URL - redirects to Google login
 export function getGoogleOAuthUrl(): string {
-  return `${API_BASE_URL}/auth/google`;
+  return `${API_BASE_URL}/auth/google/login`;
 }
 
 // ============ AI PERSONALITIES API ============
