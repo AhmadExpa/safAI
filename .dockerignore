@@ -1,0 +1,40 @@
+.git
+.gitignore
+
+__pycache__/
+**/__pycache__/
+*.py[cod]
+*.pyo
+*.pyd
+*.so
+
+.Python
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+.tox/
+.nox/
+
+.venv/
+venv/
+env/
+**/.venv/
+**/venv/
+**/env/
+
+safai-frontend-project/
+
+API Backend/.env
+API Backend/.env.*
+!API Backend/.env.example
+
+API Backend/uploads/
+*.sqlite3
+*.db
+
+*.log
+pip-wheel-metadata/
+
+.DS_Store
+Thumbs.db
