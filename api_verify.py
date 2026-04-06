@@ -12,7 +12,7 @@ import requests
 from dotenv import dotenv_values
 
 BASE_URL = "http://127.0.0.1:8000"
-ENV_PATH = "/home/ahmad/Desktop/Dany/safAI/API Backend/.env"
+ENV_PATH = "/home/ahmad/Desktop/Dany/safAI/api-backend/.env"
 
 
 @dataclass

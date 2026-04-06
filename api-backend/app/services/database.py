@@ -649,7 +649,7 @@ async def check_database_health():
                 return False
         elif "tenant or user not found" in error_msg.lower() or "authentication" in error_msg.lower():
             logger.error("❌ Database credentials were rejected by the configured Supabase/Postgres host")
-            logger.error("   - Recheck DATABASE_URL and ASYNC_DATABASE_URL in API Backend/.env")
+            logger.error("   - Recheck DATABASE_URL and ASYNC_DATABASE_URL in api-backend/.env")
             logger.error("   - Ensure the pooler username includes the project ref when using Supabase pooler URLs")
             return False
         else:

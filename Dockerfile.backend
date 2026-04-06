@@ -7,12 +7,12 @@ ENV PYTHONDONTWRITEBYTECODE=1 \
 
 WORKDIR /app
 
-COPY ["API Backend/requirements.txt", "./requirements.txt"]
+COPY ["api-backend/requirements.txt", "./requirements.txt"]
 
 RUN pip install --no-cache-dir --upgrade pip \
     && pip install --no-cache-dir -r requirements.txt
 
-COPY ["API Backend/", "./"]
+COPY ["api-backend/", "./"]
 
 RUN mkdir -p uploads/images uploads/projects \
     && addgroup --system app \

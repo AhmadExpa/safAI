@@ -25,11 +25,11 @@ env/
 
 safai-frontend-project/
 
-API Backend/.env
-API Backend/.env.*
-!API Backend/.env.example
+api-backend/.env
+api-backend/.env.*
+!api-backend/.env.example
 
-API Backend/uploads/
+api-backend/uploads/
 *.sqlite3
 *.db
 
